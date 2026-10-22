@@ -1,0 +1,15 @@
+# Ignore everything in root by default
+/*
+
+# Explicitly whitelist vepac_multitaskgp and root docs
+!/vepac_multitaskgp/
+!/README.md
+!/.gitignore
+
+# Ignore OS and temp files
+.DS_Store
+*.tmp
+~$*
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
