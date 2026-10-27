@@ -1,0 +1,217 @@
+# Hydra configuration for TA2 neural-ensemble surrogate experiments.
+defaults:
+  - _self_
+
+experiment:
+  name: vepac_surrogates
+  root_dir: ../experiments
+  seed: 42
+  deterministic: true
+  device: auto
+  resume: null
+  # When false, a run whose experiment folder already exists is written
+  # to "<name>__v2", "__v3", ... instead of overwriting the previous
+  # run's checkpoints and metrics.
+  overwrite: false
+
+wandb:
+  enabled: true
+  project: vepac_surrogates
+  entity: null
+  group: ${model.architecture}
+  tags:
+    - surrogate
+    - multi-output
+    - uncertainty
+  mode: offline
+
+
+data:
+  data_dir : ../data
+  raw_file: ../data/merged_all_2637.csv
+  sheet_name: 0
+  batch_size: 32
+  num_workers: 0
+  pin_memory: true
+  drop_missing: true
+  input_scaler: standard
+  output_scaler: standard
+  # 'none', not log1p: R2 is evaluated in physical units, while log1p
+  # training minimises log-space error. Removing the transform aligns the
+  # objective with the metric and was the largest Phase-2 win
+  # (e_charge_fC 0.9679 -> 0.9857 on fold 0). Experiment I4.
+  output_transform: none
+
+  fold: 0
+
+  # Which folds to train. null trains every fold; a list such as [0] or
+  # [0, 2] trains only those, which is useful for quick ablations.
+  folds: null
+
+  split:
+    strategy: random_kfold
+    n_splits: 5
+    shuffle: true
+    spatial_bins: 3
+    cluster_n_init: 20
+
+  inputs:
+    - l_energy_J_req_sim
+    - l_focus_z_mm_req_sim
+    - l_gdd_fs2_req_sim
+    - g_density_req_sim
+    - g_plateau_mm_req_sim
+
+  outputs:
+    - e_charge_fC
+    - x_yield_ph
+    - e_energy_mean_MeV
+    - x_energy_mean_keV
+
+  positive_outputs:
+    - e_charge_fC
+    - x_yield_ph
+    - e_energy_mean_MeV
+    - x_energy_mean_keV
+
+  # Append laser-wakefield scaling features (dephasing/depletion length,
+  # a0 proxy, chirped duration, plateau ratios) derived from the five
+  # controls. Adds no new data -- every feature is a function of the
+  # existing inputs. See dataset/datamodule.py::physics_features.
+  physics_features: false
+
+  # Output whose positivity defines whether the underlying physical
+  # process "succeeded" at all (e.g. whether any charge was produced).
+  # Rows below this threshold leave e_energy_mean_MeV / x_energy_mean_keV
+  # undefined; they are kept (not dropped) and used to train the
+  # auxiliary injection classifier below.
+  injection_output: e_charge_fC
+
+model:
+  architecture: multi_output
+  # 10 members (experiment P3). Going to 20 gave no further gain (K1).
+  ensemble_size: 10
+  # Width 256 is the single largest win found (experiment P1). Energy R2
+  # at sigma=0.10 by trunk width: 64 -> 0.868, 128 -> 0.878, 256 -> 0.931
+  # (fold 0). Width 512 did not improve on it, so capacity plateaus here.
+  hidden_dims:
+    - 256
+    - 256
+  trunk_dims:
+    - 64
+    - 64
+  branch_dims:
+    - 32
+    - 16
+  activation: silu
+  dropout: 0.10
+  residual: true
+  layer_norm: true
+  probabilistic: true
+  log_var_bounds:
+    - -10.0
+    - 5.0
+  groups:
+    measured:
+        - e_charge_fC
+        - e_energy_mean_MeV
+        - x_energy_mean_keV
+    radiation:
+        - x_yield_ph
+  # Auxiliary binary head predicting whether injection/success occurred
+  # at all (data.injection_output > 0), trained on every row -- including
+  # the ones whose dependent outputs are undefined. Only implemented for
+  # architecture: multi_output.
+  #
+  # Disabled by default: isolation experiments (see experiments/
+  # vepac_surrogates-multi_output-...-random_kfold vs.
+  # vepac_surrogates_uniformweights-...) showed the injection head
+  # sharing the trunk costs ~7-9 R2 points on every regression output
+  # (most on e_energy_mean_MeV), regardless of loss.output_weights. The
+  # classifier itself was accurate (~97.8%), but not worth that cost.
+  # Masked per-output loss (data.injection_output-driven validity masks)
+  # is kept and is a clean win on its own: it recovers the ~725 rows
+  # that used to be silently dropped from every split for e_charge_fC
+  # and x_yield_ph.
+  injection_head: false
+
+loss:
+  name: gaussian_nll
+  # uniform | uncertainty | an explicit list of per-output weights.
+  # "uncertainty" learns one log-variance per task (Kendall & Gal, 2018)
+  # to automatically balance gradients across outputs with very
+  # different scales/units. Isolation testing showed no measurable
+  # benefit over uniform for this problem, so uniform is kept as the
+  # simpler default.
+  output_weights: uniform
+  variance_regularization: 1.0e-4
+
+optimizer:
+  name: adamw
+  learning_rate: 3.0e-4
+  weight_decay: 1.0e-4
+  betas:
+    - 0.9
+    - 0.999
+  gradient_clip_norm: 1.5
+
+scheduler:
+  name: reduce_on_plateau
+  factor: 0.5
+  patience: 20
+  min_lr: 1.0e-6
+
+training:
+  epochs: 1000
+  mixed_precision: true
+  validation_interval: 1
+  test_interval: 10
+  logging_interval: 10
+  save_every_epoch: false
+  early_stopping_patience: 100
+  val_metrics: ['']
+  monitor: val/MAE
+  monitor_mode: min
+  save_best_metrics:
+    - val/MAE
+    - val/RMSE
+  prediction_plot_interval: 25
+  uncertainty_coverage: 0.90
+  # Gaussian jitter added to training targets, in units of each output's
+  # standard deviation (applied in scaled space, training only). 0.0
+  # disables it. Note that under gaussian_nll this inflates the learned
+  # aleatoric variance by roughly this amount, so predicted uncertainty
+  # is no longer directly comparable across different values.
+  #
+  # Outputs are standardised to unit variance before the noise is added,
+  # so a value of u corresponds to u * std_j in each target's own
+  # physical units -- the per-target standard deviation is applied
+  # automatically. This matters because the four targets' physical
+  # standard deviations span ~9 orders of magnitude.
+  #
+  # 0.10 is the validated setting (experiment P1). Note the mechanism is
+  # NOT label-noise regularisation of the noised target: applying noise
+  # to e_energy_mean_MeV alone gave no gain at all (H1). The benefit
+  # comes from jittering the easy, high-signal outputs, which reduces
+  # their dominance of the shared trunk and frees capacity for the hard
+  # one -- so this setting is coupled to hidden_dims and should be
+  # re-tuned if the architecture changes.
+  target_noise_std: 0.10
+
+  # When set to [low, high], the noise magnitude is resampled per
+  # training example from U(low, high) instead of being held fixed, and
+  # this takes precedence over target_noise_std. null disables it.
+  target_noise_std_range: null
+
+  # Gaussian jitter on the scaled inputs (training only), in units of
+  # each input's standard deviation. This is a true data augmentation:
+  # it approximates Tikhonov regularisation, and it is physically
+  # meaningful here because the five inputs are *requested* simulator
+  # settings (*_req_sim) that differ from the realised values.
+  input_noise_std: 0.0
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+
