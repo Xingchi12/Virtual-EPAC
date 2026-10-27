@@ -3,37 +3,32 @@ import os
 import pandas as pd
 from pathlib import Path
 
-if './src' not in sys.path:
-    sys.path.insert(0, './src')
 
-from src import utils
-from src.predictor import Predictor
+import utils
+from predictor import Predictor
 
 if __name__ == '__main__':
 
-    input_file_path = './data/test_selected_data.csv'
-    output_file_tag = f"{os.path.basename(input_file_path).split('.')[0]}_predictions_using_predictor"
+    input_file_path = '../data/test_selected_data.csv'
+    output_file_tag = f"{os.path.basename(input_file_path).split('.')[0]}_enn_predictions"
 
-    root_exp_dir = Path('./experiments')
-    exp_name = 'exp_p3-multi_output-gaussian_nll-scaler_standard-ensembles10-random_kfold'
-    n_folds = 5
+    exp_name = Path('../experiments/exp_p3-multi_output-gaussian_nll-scaler_standard-ensembles10-random_kfold')
 
-    out_dir = root_exp_dir / exp_name / 'predictions'
+    out_dir = exp_name / 'predictions'
     out_dir.mkdir(parents=True, exist_ok=True)
 
     all_fold_predictions = []
 
+    n_folds = 5
+
     for fold in range(n_folds):
-
-        exp_dir = root_exp_dir / exp_name / f'fold{fold}'
-
-        predictor = Predictor.from_experiment(exp_dir, checkpoint="checkpoints/best.pt")
-
-        predictor = Predictor.from_experiment(
-            exp_dir,
-            checkpoint="checkpoints/best.pt",
-            calibrate_std=True,
-            calibration_method="scalar"
+        
+        # Create a predictor for each fold models
+        predictor=Predictor.from_experiment(
+        exp_dir=exp_name / f'fold{fold}',
+        checkpoint="checkpoints/best.pt",
+        calibrate_std=True,
+        calibration_method="scalar"
         )
 
         df_pred_file = predictor.predict_from_csv_file(
